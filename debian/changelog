@@ -1,0 +1,5 @@
+python-msrest (0.1.2-1) pexip; urgency=low
+
+  * Initial release
+
+ -- John-Mark Bell <jmb@pexip.com>  Fri, 18 Mar 2016 15:36:40 +0000
