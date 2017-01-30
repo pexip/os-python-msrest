@@ -1,3 +1,9 @@
+python-msrest (0.1.2-2) pexip; urgency=low
+
+  * No-change rebuild
+
+ -- John-Mark Bell <jmb@pexip.com>  Mon, 30 Jan 2017 17:56:09 +0000
+
 python-msrest (0.1.2-1) pexip; urgency=low
 
   * Initial release
