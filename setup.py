@@ -28,14 +28,13 @@ from setuptools import setup
 
 setup(
     name='msrest',
-    version='0.1.2',
+    version='0.4.5',
     author='Microsoft Corporation',
     packages=['msrest'],
-    url=("https://github.com/xingwu1/autorest/tree/python/"
-         "ClientRuntimes/Python/msrest"),
+    url=("https://github.com/Azure/msrest-for-python"),
     license='MIT License',
     description='AutoRest swagger generator Python client runtime.',
-    long_description=open('readme.rst').read(),
+    long_description=open('README.rst').read(),
     classifiers=[
         'Development Status :: 4 - Beta',
         'Programming Language :: Python',
@@ -45,14 +44,16 @@ setup(
         'Programming Language :: Python :: 3.3',
         'Programming Language :: Python :: 3.4',
         'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3.6',
         'License :: OSI Approved :: MIT License',
         'Topic :: Software Development'],
     install_requires=[
         "requests>=2.7.0",
-        "keyring>=5.6",
         "requests_oauthlib>=0.5.0",
         "isodate>=0.5.4",
         "certifi>=2015.9.6.2",
-        "chardet>=2.3.0",
-        "enum34>=1.0.4"],
+    ],
+    extras_require={
+        ":python_version<'3.4'": ['enum34>=1.0.4'],
+    }
 )
