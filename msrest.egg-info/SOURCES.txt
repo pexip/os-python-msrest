@@ -1,5 +1,6 @@
 MANIFEST.in
-readme.rst
+README.rst
+setup.cfg
 setup.py
 msrest/__init__.py
 msrest/authentication.py

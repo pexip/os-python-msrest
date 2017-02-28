@@ -25,17 +25,18 @@
 # --------------------------------------------------------------------------
 
 from base64 import b64decode, b64encode
+import calendar
 import datetime
 import decimal
 from enum import Enum
 import json
+import logging
 import re
 try:
     from urllib import quote
 except ImportError:
     from urllib.parse import quote
 
-import chardet
 import isodate
 
 from .exceptions import (
@@ -48,6 +49,31 @@ try:
     basestring
 except NameError:
     basestring = str
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class UTC(datetime.tzinfo):
+    """Time Zone info for handling UTC"""
+
+    def utcoffset(self, dt):
+        """UTF offset for UTC is 0."""
+        return datetime.timedelta(0)
+
+    def tzname(self, dt):
+        """Timestamp representation."""
+        return "Z"
+
+    def dst(self, dt):
+        """No daylight saving for UTC."""
+        return datetime.timedelta(hours=1)
+
+
+try:
+    from datetime import timezone
+    TZ_UTC = timezone.utc
+except ImportError:
+    TZ_UTC = UTC()
 
 
 class Model(object):
@@ -67,7 +93,7 @@ class Model(object):
     def __eq__(self, other):
         """Compare objects by comparing all attributes."""
         if isinstance(other, self.__class__):
-            return self.__dict__ == other.__dict__
+            return self.__class__.__dict__ == other.__class__.__dict__
         return False
 
     def __ne__(self, other):
@@ -87,29 +113,72 @@ class Model(object):
         return {}
 
     @classmethod
+    def _flatten_subtype(cls, key, objects):
+        if not '_subtype_map' in cls.__dict__:
+            return {}
+        result = dict(cls._subtype_map[key])
+        for valuetype in cls._subtype_map[key].values():
+            result.update(objects[valuetype]._flatten_subtype(key, objects))
+        return result
+
+    @classmethod
     def _classify(cls, response, objects):
         """Check the class _subtype_map for any child classes.
-        We want to ignore any inheirited _subtype_maps.
+        We want to ignore any inherited _subtype_maps.
+        Remove the polymorphic key from the initial data.
         """
-        try:
-            map = cls.__dict__.get('_subtype_map', {})
+        for subtype_key in cls.__dict__.get('_subtype_map', {}).keys():
+            subtype_value = None
 
-            for _type, _classes in map.items():
-                classification = response.get(_type)
-                try:
-                    return objects[_classes[classification]]
-                except KeyError:
-                    pass
+            rest_api_response_key = _decode_attribute_map_key(cls._attribute_map[subtype_key]['key'])
+            subtype_value = response.pop(rest_api_response_key, None) or response.pop(subtype_key, None)
+            if subtype_value:
+                flatten_mapping_type = cls._flatten_subtype(subtype_key, objects)
+                return objects[flatten_mapping_type[subtype_value]]
+        return cls
 
-                for c in _classes:
-                    try:
-                        _cls = objects[_classes[c]]
-                        return _cls._classify(response, objects)
-                    except (KeyError, TypeError):
-                        continue
-            raise TypeError("Object cannot be classified futher.")
-        except AttributeError:
-            raise TypeError("Object cannot be classified futher.")
+def _decode_attribute_map_key(key):
+    """This decode a key in an _attribute_map to the actual key we want to look at
+       inside the received data.
+
+       :param str key: A key string from the generated code
+    """
+    return key.replace('\\.', '.')
+
+def _convert_to_datatype(data, data_type, localtypes):
+    if data is None:
+        return data
+    data_obj = localtypes.get(data_type.strip('{[]}'))
+    if data_obj:
+        if data_type.startswith('['):
+            data = [
+                _convert_to_datatype(
+                    param, data_type[1:-1], localtypes) for param in data
+            ]
+        elif data_type.startswith('{'):
+            data = {
+                key: _convert_to_datatype(
+                    data[key], data_type[1:-1], localtypes) for key in data
+            }
+        elif issubclass(data_obj, Enum):
+            return data
+        elif not isinstance(data, data_obj):
+            data_obj = data_obj._classify(data, localtypes)
+            result = {
+                key: _convert_to_datatype(
+                    data[key],
+                    data_obj._attribute_map[key]['type'],
+                    localtypes) for key in data
+            }
+            data = data_obj(**result)
+        else:
+            try:
+                for attr, map in data._attribute_map.items():
+                    setattr(data, attr, _convert_to_datatype(
+                        getattr(data, attr), map['type'], localtypes))
+            except AttributeError:
+                pass
+    return data
 
 
 class Serializer(object):
@@ -129,25 +198,28 @@ class Serializer(object):
         "maximum_ex": lambda x, y: x >= y,
         "min_items": lambda x, y: len(x) < y,
         "max_items": lambda x, y: len(x) > y,
-        "pattern": lambda x, y: not re.match(y, x),
+        "pattern": lambda x, y: not re.match(y, x, re.UNICODE),
         "unique": lambda x, y: len(x) != len(set(x)),
         "multiple": lambda x, y: x % y != 0
         }
-    flattten = re.compile(r"(?<!\\)\.")
+    flatten = re.compile(r"(?<!\\)\.")
 
-    def __init__(self):
+    def __init__(self, classes=None):
         self.serialize_type = {
             'iso-8601': Serializer.serialize_iso,
             'rfc-1123': Serializer.serialize_rfc,
+            'unix-time': Serializer.serialize_unix,
             'duration': Serializer.serialize_duration,
             'date': Serializer.serialize_date,
             'decimal': Serializer.serialize_decimal,
             'long': Serializer.serialize_long,
             'bytearray': Serializer.serialize_bytearray,
+            'base64': Serializer.serialize_base64,
             'object': self.serialize_object,
             '[]': self.serialize_iter,
             '{}': self.serialize_dict
             }
+        self.dependencies = dict(classes) if classes else {}
 
     def _serialize(self, target_obj, data_type=None, **kwargs):
         """Serialize data into a string according to type.
@@ -176,17 +248,17 @@ class Serializer(object):
 
         try:
             attributes = target_obj._attribute_map
-            self._classify_data(target_obj, class_name, serialized)
-
             for attr, map in attributes.items():
                 attr_name = attr
+                debug_name = "{}.{}".format(class_name, attr_name)
                 try:
-                    keys = self.flattten.split(map['key'])
-                    keys = [k.replace('\\.', '.') for k in keys]
+                    keys = self.flatten.split(map['key'])
+                    keys = [_decode_attribute_map_key(k) for k in keys]
                     attr_type = map['type']
                     orig_attr = getattr(target_obj, attr)
                     validation = target_obj._validation.get(attr_name, {})
-                    self.validate(orig_attr, attr_name, **validation)
+                    orig_attr = self.validate(
+                        orig_attr, debug_name, **validation)
                     new_attr = self.serialize_data(
                         orig_attr, attr_type, **kwargs)
 
@@ -205,23 +277,11 @@ class Serializer(object):
                     continue
 
         except (AttributeError, KeyError, TypeError) as err:
-            msg = "Attribute {} in object {} cannot be serialized.".format(
-                attr_name, class_name)
+            msg = "Attribute {} in object {} cannot be serialized.\n{}".format(
+                attr_name, class_name, str(target_obj))
             raise_with_traceback(SerializationError, msg, err)
         else:
             return serialized
-
-    def _classify_data(self, target_obj, class_name, serialized):
-        """Check whether this object is a child and therefor needs to be
-        classified in the message.
-        """
-        try:
-            for _type, _classes in target_obj._get_subtype_map().items():
-                for ref, name in _classes.items():
-                    if name == class_name:
-                        serialized[_type] = ref
-        except AttributeError:
-            pass  # TargetObj has no _subtype_map so we don't need to classify.
 
     def body(self, data, data_type, **kwargs):
         """Serialize data intended for a request body.
@@ -234,6 +294,7 @@ class Serializer(object):
         """
         if data is None:
             raise ValidationError("required", "body", True)
+        data = _convert_to_datatype(data, data_type, self.dependencies)
         return self._serialize(data, data_type, **kwargs)
 
     def url(self, name, data, data_type, **kwargs):
@@ -245,7 +306,7 @@ class Serializer(object):
         :raises: TypeError if serialization fails.
         :raises: ValueError if data is None
         """
-        self.validate(data, name, required=True, **kwargs)
+        data = self.validate(data, name, required=True, **kwargs)
         try:
             output = self.serialize_data(data, data_type, **kwargs)
             if data_type == 'bool':
@@ -269,7 +330,7 @@ class Serializer(object):
         :raises: TypeError if serialization fails.
         :raises: ValueError if data is None
         """
-        self.validate(data, name, required=True, **kwargs)
+        data = self.validate(data, name, required=True, **kwargs)
         try:
             if data_type in ['[str]']:
                 data = ["" if d is None else d for d in data]
@@ -295,7 +356,7 @@ class Serializer(object):
         :raises: TypeError if serialization fails.
         :raises: ValueError if data is None
         """
-        self.validate(data, name, required=True, **kwargs)
+        data = self.validate(data, name, required=True, **kwargs)
         try:
             if data_type in ['[str]']:
                 data = ["" if d is None else d for d in data]
@@ -315,6 +376,8 @@ class Serializer(object):
             raise ValidationError("required", name, True)
         elif data is None:
             return
+        elif kwargs.get('readonly'):
+            return
 
         try:
             for key, value in kwargs.items():
@@ -323,6 +386,8 @@ class Serializer(object):
                     raise ValidationError(key, name, value)
         except TypeError:
             raise ValidationError("unknown", name)
+        else:
+            return data
 
     def serialize_data(self, data, data_type, **kwargs):
         """Serialize generic data according to supplied data type.
@@ -345,8 +410,9 @@ class Serializer(object):
             elif data_type in self.serialize_type:
                 return self.serialize_type[data_type](data, **kwargs)
 
-            elif isinstance(data, Enum):
-                return data.value
+            enum_type = self.dependencies.get(data_type)
+            if enum_type and issubclass(enum_type, Enum):
+                return Serializer.serialize_enum(data, enum_obj=enum_type)
 
             iter_type = data_type[0] + data_type[-1]
             if iter_type in self.serialize_type:
@@ -379,6 +445,10 @@ class Serializer(object):
         :rtype: str
         """
         try:
+            return data.value
+        except AttributeError:
+            pass
+        try:
             if isinstance(data, unicode):
                 return data.encode(encoding='utf-8')
         except NameError:
@@ -406,7 +476,8 @@ class Serializer(object):
                 serialized.append(None)
 
         if div:
-            return div.join(serialized)
+            serialized = ['' if s is None else s for s in serialized]
+            serialized = div.join(serialized)
         return serialized
 
     def serialize_dict(self, attr, dict_type, **kwargs):
@@ -421,10 +492,10 @@ class Serializer(object):
         serialized = {}
         for key, value in attr.items():
             try:
-                serialized[str(key)] = self.serialize_data(
+                serialized[self.serialize_unicode(key)] = self.serialize_data(
                     value, dict_type, **kwargs)
             except ValueError:
-                serialized[str(key)] = None
+                serialized[self.serialize_unicode(key)] = None
         return serialized
 
     def serialize_object(self, attr, **kwargs):
@@ -436,6 +507,8 @@ class Serializer(object):
         :param dict attr: Object to be serialized.
         :rtype: dict or str
         """
+        if attr is None:
+            return None
         obj_type = type(attr)
         if obj_type in self.basic_types:
             return self.serialize_basic(attr, self.basic_types[obj_type])
@@ -444,10 +517,10 @@ class Serializer(object):
             serialized = {}
             for key, value in attr.items():
                 try:
-                    serialized[str(key)] = self.serialize_object(
+                    serialized[self.serialize_unicode(key)] = self.serialize_object(
                         value, **kwargs)
                 except ValueError:
-                    serialized[str(key)] = None
+                    serialized[self.serialize_unicode(key)] = None
             return serialized
 
         if obj_type == list:
@@ -464,6 +537,22 @@ class Serializer(object):
             return str(attr)
 
     @staticmethod
+    def serialize_enum(attr, enum_obj=None):
+        try:
+            return attr.value
+        except AttributeError:
+            pass
+        try:
+            enum_obj(attr)
+            return attr
+        except ValueError:
+            for enum_value in enum_obj:
+                if enum_value.value.lower() == str(attr).lower():
+                    return enum_value.value
+            error = "{!r} is not valid value for enum {!r}"
+            raise SerializationError(error.format(attr, enum_obj))
+
+    @staticmethod
     def serialize_bytearray(attr, **kwargs):
         """Serialize bytearray into base-64 string.
 
@@ -471,6 +560,16 @@ class Serializer(object):
         :rtype: str
         """
         return b64encode(attr).decode()
+
+    @staticmethod
+    def serialize_base64(attr, **kwargs):
+        """Serialize str into base-64 string.
+
+        :param attr: Object to be serialized.
+        :rtype: str
+        """
+        encoded = b64encode(attr).decode('ascii')
+        return encoded.strip('=').replace('+', '-').replace('/', '_')
 
     @staticmethod
     def serialize_decimal(attr, **kwargs):
@@ -500,6 +599,8 @@ class Serializer(object):
         :param Date attr: Object to be serialized.
         :rtype: str
         """
+        if isinstance(attr, str):
+            attr = isodate.parse_date(attr)
         t = "{:04}-{:02}-{:02}".format(attr.year, attr.month, attr.day)
         return t
 
@@ -510,6 +611,8 @@ class Serializer(object):
         :param TimeDelta attr: Object to be serialized.
         :rtype: str
         """
+        if isinstance(attr, str):
+            attr = isodate.parse_duration(attr)
         return isodate.duration_isoformat(attr)
 
     @staticmethod
@@ -521,6 +624,9 @@ class Serializer(object):
         :raises: TypeError if format invalid.
         """
         try:
+            if not attr.tzinfo:
+                _LOGGER.warning(
+                    "Datetime with no tzinfo will be considered UTC.")
             utc = attr.utctimetuple()
         except AttributeError:
             raise TypeError("RFC1123 object must be valid Datetime object.")
@@ -540,8 +646,10 @@ class Serializer(object):
         """
         if isinstance(attr, str):
             attr = isodate.parse_datetime(attr)
-
         try:
+            if not attr.tzinfo:
+                _LOGGER.warning(
+                    "Datetime with no tzinfo will be considered UTC.")
             utc = attr.utctimetuple()
             if utc.tm_year > 9999 or utc.tm_year < 1:
                 raise OverflowError("Hit max or min date")
@@ -554,6 +662,28 @@ class Serializer(object):
         except (ValueError, OverflowError) as err:
             msg = "Unable to serialize datetime object."
             raise_with_traceback(SerializationError, msg, err)
+        except AttributeError as err:
+            msg = "ISO-8601 object must be valid Datetime object."
+            raise_with_traceback(TypeError, msg, err)
+
+    @staticmethod
+    def serialize_unix(attr, **kwargs):
+        """Serialize Datetime object into IntTime format.
+        This is represented as seconds.
+
+        :param Datetime attr: Object to be serialized.
+        :rtype: int
+        :raises: SerializationError if format invalid
+        """
+        if isinstance(attr, int):
+            return attr
+        try:
+            if not attr.tzinfo:
+                _LOGGER.warning(
+                    "Datetime with no tzinfo will be considered UTC.")
+            return int(calendar.timegm(attr.utctimetuple()))
+        except AttributeError:
+            raise TypeError("Unix time object must be valid Datetime object.")
 
 
 class Deserializer(object):
@@ -569,20 +699,22 @@ class Deserializer(object):
         '\.?\d*Z?[-+]?[\d{2}]?:?[\d{2}]?')
     flatten = re.compile(r"(?<!\\)\.")
 
-    def __init__(self, classes={}):
+    def __init__(self, classes=None):
         self.deserialize_type = {
             'iso-8601': Deserializer.deserialize_iso,
             'rfc-1123': Deserializer.deserialize_rfc,
+            'unix-time': Deserializer.deserialize_unix,
             'duration': Deserializer.deserialize_duration,
             'date': Deserializer.deserialize_date,
             'decimal': Deserializer.deserialize_decimal,
             'long': Deserializer.deserialize_long,
             'bytearray': Deserializer.deserialize_bytearray,
+            'base64': Deserializer.deserialize_base64,
             'object': self.deserialize_object,
             '[]': self.deserialize_iter,
             '{}': self.deserialize_dict
             }
-        self.dependencies = dict(classes)
+        self.dependencies = dict(classes) if classes else {}
 
     def __call__(self, target_obj, response_data):
         """Call the deserializer to process a REST response.
@@ -590,14 +722,14 @@ class Deserializer(object):
         :param str target_obj: Target data type to deserialize to.
         :param requests.Response response_data: REST response object.
         :raises: DeserializationError if deserialization fails.
-        :returns: Deserialized object.
+        :return: Deserialized object.
         """
         data = self._unpack_content(response_data)
         response, class_name = self._classify_target(target_obj, data)
 
         if isinstance(response, basestring):
             return self.deserialize_data(data, response)
-        elif isinstance(response, Enum) or class_name == 'EnumMeta':
+        elif isinstance(response, type) and issubclass(response, Enum):
             return self.deserialize_enum(data, response)
 
         if data is None:
@@ -613,9 +745,9 @@ class Deserializer(object):
                 while '.' in key:
                     dict_keys = self.flatten.split(key)
                     if len(dict_keys) == 1:
-                        key = dict_keys[0].replace('\\.', '.')
+                        key = _decode_attribute_map_key(dict_keys[0])
                         break
-                    working_key = dict_keys[0].replace('\\.', '.')
+                    working_key = _decode_attribute_map_key(dict_keys[0])
                     working_data = working_data.get(working_key, data)
                     key = '.'.join(dict_keys[1:])
 
@@ -647,8 +779,8 @@ class Deserializer(object):
 
         try:
             target = target._classify(data, self.dependencies)
-        except (TypeError, AttributeError):
-            pass  # Target has no subclasses, so can't classify further.
+        except AttributeError:
+            pass  # Target is not a Model, no classify
         return target, target.__class__.__name__
 
     def _unpack_content(self, raw_data):
@@ -659,25 +791,17 @@ class Deserializer(object):
          be returned.
         """
         if raw_data and isinstance(raw_data, bytes):
-            data = raw_data.decode(
-                encoding=chardet.detect(raw_data)['encoding'])
+            data = raw_data.decode(encoding='utf-8')
         else:
             data = raw_data
 
-        if hasattr(raw_data, 'content'):
-            if not raw_data.content:
+        try:
+            # This is a requests.Response, json valid if nothing fail
+            if not raw_data.text:
                 return None
-
-            if isinstance(raw_data.content, bytes):
-                encoding = chardet.detect(raw_data.content)["encoding"]
-                data = raw_data.content.decode(encoding=encoding)
-            else:
-                data = raw_data.content
-            try:
-                return json.loads(data)
-            except (ValueError, TypeError):
-                return data
-
+            return json.loads(raw_data.text)
+        except (ValueError, TypeError, AttributeError):
+                pass
         return data
 
     def _instantiate_model(self, response, attrs):
@@ -686,21 +810,32 @@ class Deserializer(object):
         :param response: The response model class.
         :param d_attrs: The deserialized response attributes.
         """
-        subtype = response._get_subtype_map()
-        try:
-            kwargs = {k: v for k, v in attrs.items() if k not in subtype}
-            return response(**kwargs)
-        except TypeError:
-            pass
-
-        try:
-            for attr, value in attrs.items():
-                setattr(response, attr, value)
-            return response
-        except Exception as exp:
-            msg = "Unable to instantiate or populate response model. "
-            msg += "Type: {}, Error: {}".format(type(response), exp)
-            raise DeserializationError(msg)
+        if callable(response):
+            subtype = response._get_subtype_map()
+            try:
+                readonly = [k for k, v in response._validation.items()
+                            if v.get('readonly')]
+                const = [k for k, v in response._validation.items()
+                         if v.get('constant')]
+                kwargs = {k: v for k, v in attrs.items()
+                          if k not in subtype and k not in readonly + const}
+                response_obj = response(**kwargs)
+                for attr in readonly:
+                    setattr(response_obj, attr, attrs.get(attr))
+                return response_obj
+            except TypeError as err:
+                msg = "Unable to deserialize {} into model {}. ".format(
+                    kwargs, response)
+                raise DeserializationError(msg + str(err))
+        else:
+            try:
+                for attr, value in attrs.items():
+                    setattr(response, attr, value)
+                return response
+            except Exception as exp:
+                msg = "Unable to populate response model. "
+                msg += "Type: {}, Error: {}".format(type(response), exp)
+                raise DeserializationError(msg)
 
     def deserialize_data(self, data, data_type):
         """Process data for deserialization according to data type.
@@ -708,7 +843,7 @@ class Deserializer(object):
         :param str data: The response string to be deserialized.
         :param str data_type: The type to deserialize to.
         :raises: DeserializationError if deserialization fails.
-        :returns: Deserialized object.
+        :return: Deserialized object.
         """
         if data is None:
             return data
@@ -757,9 +892,9 @@ class Deserializer(object):
         :rtype: dict
         """
         if isinstance(attr, list):
-            return {str(x['key']): self.deserialize_data(
+            return {x['key']: self.deserialize_data(
                 x['value'], dict_type) for x in attr}
-        return {str(k): self.deserialize_data(
+        return {k: self.deserialize_data(
             v, dict_type) for k, v in attr.items()}
 
     def deserialize_object(self, attr, **kwargs):
@@ -770,6 +905,8 @@ class Deserializer(object):
         :rtype: dict
         :raises: TypeError if non-builtin datatype encountered.
         """
+        if attr is None:
+            return None
         if isinstance(attr, basestring):
             return self.deserialize_basic(attr, 'str')
         obj_type = type(attr)
@@ -780,10 +917,10 @@ class Deserializer(object):
             deserialized = {}
             for key, value in attr.items():
                 try:
-                    deserialized[str(key)] = self.deserialize_object(
+                    deserialized[key] = self.deserialize_object(
                         value, **kwargs)
                 except ValueError:
-                    deserialized[str(key)] = None
+                    deserialized[key] = None
             return deserialized
 
         if obj_type == list:
@@ -848,6 +985,14 @@ class Deserializer(object):
         :rtype: Enum
         :raises: DeserializationError if string is not valid enum value.
         """
+        if isinstance(data, int):
+            # Workaround. We might consider remove it in the future.
+            # https://github.com/Azure/azure-rest-api-specs/issues/141
+            try:
+                return list(enum_obj.__members__.values())[data]
+            except IndexError:
+                error = "{!r} is not a valid index for enum {!r}"
+                raise DeserializationError(error.format(data, enum_obj))
         try:
             return enum_obj(str(data))
         except ValueError:
@@ -866,6 +1011,19 @@ class Deserializer(object):
         :raises: TypeError if string format invalid.
         """
         return bytearray(b64decode(attr))
+
+    @staticmethod
+    def deserialize_base64(attr):
+        """Deserialize base64 encoded string into string.
+
+        :param str attr: response string to be deserialized.
+        :rtype: bytearray
+        :raises: TypeError if string format invalid.
+        """
+        padding = '=' * (3 - (len(attr) + 3) % 4)
+        attr = attr + padding
+        encoded = attr.replace('-', '+').replace('_', '/')
+        return b64decode(encoded)
 
     @staticmethod
     def deserialize_decimal(attr):
@@ -931,7 +1089,8 @@ class Deserializer(object):
         try:
             date_obj = datetime.datetime.strptime(
                 attr, "%a, %d %b %Y %H:%M:%S %Z")
-            date_obj = date_obj.replace(tzinfo=UTC())
+            if not date_obj.tzinfo:
+                date_obj = date_obj.replace(tzinfo=TZ_UTC)
         except ValueError as err:
             msg = "Cannot deserialize to rfc datetime object."
             raise_with_traceback(DeserializationError, msg, err)
@@ -973,18 +1132,19 @@ class Deserializer(object):
         else:
             return date_obj
 
+    @staticmethod
+    def deserialize_unix(attr):
+        """Serialize Datetime object into IntTime format.
+        This is represented as seconds.
 
-class UTC(datetime.tzinfo):
-    """Time Zone info for handling UTC"""
-
-    def utcoffset(self, dt):
-        """UTF offset for UTC is 0."""
-        return datetime.timedelta(hours=0, minutes=0)
-
-    def tzname(self, dt):
-        """Timestamp representation."""
-        return "Z"
-
-    def dst(self, dt):
-        """No daylight saving for UTC."""
-        return datetime.timedelta(0)
+        :param int attr: Object to be serialized.
+        :rtype: Datetime
+        :raises: DeserializationError if format invalid
+        """
+        try:
+            date_obj = datetime.datetime.fromtimestamp(attr, TZ_UTC)
+        except ValueError as err:
+            msg = "Cannot deserialize to unix datetime object."
+            raise_with_traceback(DeserializationError, msg, err)
+        else:
+            return date_obj
