@@ -1,3 +1,9 @@
+python-msrest (0.4.5-1pexip1) pexip; urgency=low
+
+  * import patch to fix cloudbursting error. Pexip issue #11476
+
+ -- Vincent Sanders <vince@pexip.com>  Thu, 16 Nov 2017 11:44:11 +0000
+
 python-msrest (0.4.5-1) pexip; urgency=low
 
   * New upstream release
